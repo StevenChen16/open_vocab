@@ -14,15 +14,17 @@ from trainer import (
     register_custom_modules, 
     modify_yaml_config, 
     get_text_embeddings, 
-    train_rl, 
     setup_logger,
+    DetectionRLEnv,
+    ReplayBuffer,
+    update_projection_params,
     SemanticHead
 )
 
 # 设置命令行参数
 def parse_args():
     parser = argparse.ArgumentParser(description="Train open-vocab detector with RL")
-    parser.add_argument('--data', type=str, default='coco8.yaml', help='dataset.yaml path')
+    parser.add_argument('--data', type=str, default='data/coco8.yaml', help='dataset.yaml path')
     parser.add_argument('--model', type=str, default='yolo11n.pt', help='model.pt path')
     parser.add_argument('--img-size', type=int, default=640, help='image size')
     parser.add_argument('--batch-size', type=int, default=16, help='batch size')
@@ -159,6 +161,309 @@ def load_coco_dataset(data_yaml, img_size=640):
     
     return train_adapter, val_adapter, class_names
 
+def train_rl_direct(
+    model_path,          # 预训练模型路径
+    yaml_path,           # 修改后的yaml配置路径
+    dataset,             # 训练数据集
+    class_names,         # 类别名称
+    num_episodes=1000,   # 训练回合数
+    learning_rate=1e-4,  # 学习率
+    gamma=0.99,          # 折扣因子
+    epsilon=0.3,         # 探索率
+    epsilon_decay=0.995, # 探索率衰减
+    min_epsilon=0.05,    # 最小探索率
+    batch_size=32,       # 批大小
+    semantic_dim=512,    # 语义向量维度
+    reward_weights={'accuracy': 0.6, 'semantic': 0.3, 'exploration': 0.1},  # 奖励权重
+    reward_scale=10.0,   # 奖励缩放因子
+    save_dir='runs/rl_train', # 保存目录
+    device='cuda' if torch.cuda.is_available() else 'cpu',  # 设备
+    use_reward_update=True,  # 是否使用基于奖励的参数更新
+):
+    """
+    直接实现的RL训练函数，绕过原始train_rl函数的问题
+    """
+    # 确保目录存在
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # 初始化日志
+    logger = setup_logger()
+    logger.info(f"开始RL训练，设备: {device}")
+    
+    # 首先注册自定义模块
+    register_custom_modules()
+    logger.info("已注册自定义模块")
+    
+    # 获取类别文本特征
+    text_embeddings = get_text_embeddings(class_names, semantic_dim, device)
+    logger.info(f"文本特征准备完成，形状: {text_embeddings.shape}")
+    
+    # 加载预训练模型
+    model = Model(model_path)
+    logger.info(f"已加载预训练模型: {model_path}")
+    
+    # 确保模型在正确的设备上
+    model.model = model.model.to(device)
+    
+    # 检测头的通道数
+    ch_list = []
+    last_layer = model.model.model[-1]
+    if hasattr(last_layer, 'reg_conv') and isinstance(last_layer.reg_conv, nn.ModuleList):
+        for conv in last_layer.reg_conv:
+            if hasattr(conv, 'in_channels'):
+                ch_list.append(conv.in_channels)
+    
+    if not ch_list:
+        logger.warning("无法从检测头确定通道数，使用默认值[64, 128, 256]")
+        ch_list = [64, 128, 256]
+    
+    logger.info(f"检测到的通道数: {ch_list}")
+    
+    # 创建RL环境
+    env = DetectionRLEnv(
+        model=model.model,
+        text_embeddings=text_embeddings,
+        dataset=dataset,
+        semantic_dim=semantic_dim,
+        reward_weights=reward_weights,
+        reward_scale=reward_scale,
+        device=device,
+        ch_list=ch_list
+    )
+    logger.info("RL环境创建完成")
+    
+    # 定义投影层优化器
+    projection_params = []
+    detection_head = model.model.model[-1]
+    
+    # 收集语义投影层参数
+    if hasattr(detection_head, 'semantic_projection'):
+        logger.info(f"找到semantic_projection层，添加参数...")
+        projection_params.extend(list(detection_head.semantic_projection.parameters()))
+    
+    if hasattr(detection_head, 'semantic_extract'):
+        logger.info(f"找到semantic_extract层，添加参数...")
+        for extract_module in detection_head.semantic_extract:
+            params = list(extract_module.parameters())
+            projection_params.extend(params)
+    
+    # 搜索可能的语义相关层
+    if not projection_params:
+        logger.warning("未找到标准语义层，搜索其他可能的语义相关层...")
+        # 搜索所有可能的线性层或卷积层作为语义相关层
+        for name, module in detection_head.named_modules():
+            if isinstance(module, (nn.Linear, nn.Conv2d)):
+                params = list(module.parameters())
+                if params:
+                    logger.info(f"找到可能的语义层 {name}，添加 {len(params)} 个参数")
+                    projection_params.extend(params)
+    
+    # 如果仍然没有参数，创建一个新的语义投影头
+    if not projection_params:
+        logger.warning("未找到任何可训练参数，创建自定义语义投影层...")
+        # 创建一个简单的语义投影头
+        semantic_head = SemanticHead(
+            input_dim=semantic_dim,
+            hidden_dim=semantic_dim * 2,
+            output_dim=semantic_dim
+        ).to(device)
+        
+        # 将投影头添加到模型中
+        model.semantic_head = semantic_head
+        
+        # 添加参数
+        projection_params.extend(list(semantic_head.parameters()))
+        
+        logger.info(f"创建了自定义语义投影头，参数数量: {len(list(semantic_head.parameters()))}")
+    
+    # 检查参数数量
+    if not projection_params:
+        # 如果仍然没有参数，创建一个虚拟参数以避免优化器错误
+        logger.warning("仍然没有找到参数，创建虚拟参数...")
+        dummy_param = nn.Parameter(torch.zeros(1, requires_grad=True, device=device))
+        model.dummy_param = dummy_param
+        projection_params.append(dummy_param)
+    
+    # 输出参数统计
+    logger.info(f"总共找到 {len(projection_params)} 个可训练参数")
+    
+    # 确保所有参数都在设备上
+    for param in projection_params:
+        if param.device != torch.device(device):
+            param.data = param.data.to(device)
+    
+    # 创建优化器
+    optimizer = torch.optim.Adam(projection_params, lr=learning_rate)
+    logger.info(f"优化器已创建，学习率: {learning_rate}")
+    
+    # 创建经验回放缓冲区
+    replay_buffer = ReplayBuffer()
+    
+    # RL训练循环
+    total_steps = 0
+    episode_rewards = []
+    current_epsilon = epsilon  # 初始探索率
+    
+    # 使用tqdm进度条
+    for episode in tqdm(range(num_episodes), desc="Training RL", unit="episode"):
+        # 重置环境
+        state = env.reset()
+        episode_reward = 0
+        done = False
+        
+        while not done:
+            # 探索或利用
+            if np.random.random() < current_epsilon:
+                # 探索: 创建随机投影矩阵
+                action = []
+                for ch in env.ch_list:
+                    action.append(torch.randn(ch, semantic_dim, device=device))
+            else:
+                # 利用: 使用当前模型的投影参数
+                with torch.no_grad():
+                    # 获取语义投影层的权重
+                    action = []
+                    
+                    # 尝试提取投影矩阵
+                    if hasattr(detection_head, 'semantic_projection'):
+                        for name, param in detection_head.semantic_projection.named_parameters():
+                            if 'weight' in name and '0.weight' in name:
+                                action.append(param.t())
+                                break
+                    
+                    if not action and hasattr(detection_head, 'semantic_extract'):
+                        for extract in detection_head.semantic_extract:
+                            for m in extract.modules():
+                                if isinstance(m, nn.Conv2d) and m.out_channels == semantic_dim:
+                                    weight = m.weight.data
+                                    proj_matrix = weight.view(weight.shape[0], weight.shape[1], -1).mean(dim=2).t()
+                                    action.append(proj_matrix)
+                    
+                    # 如果以上方法都失败，使用随机初始化
+                    if not action:
+                        for ch in env.ch_list:
+                            action.append(torch.randn(ch, semantic_dim, device=device))
+                    
+                    # 确保创建足够的矩阵
+                    while len(action) < len(env.ch_list):
+                        ch = env.ch_list[len(action)]
+                        action.append(torch.randn(ch, semantic_dim, device=device))
+            
+            # 执行动作
+            try:
+                next_state, reward, done, info = env.step(action)
+            except Exception as e:
+                logger.warning(f"执行动作时出错: {e}")
+                # 创建默认返回值
+                next_state = state
+                reward = torch.tensor(-1.0, device=device)  # 负奖励
+                done = True
+                info = {}
+            
+            # 存储经验
+            replay_buffer.push(state, action, reward, next_state, done)
+            
+            # 经验回放学习
+            if len(replay_buffer) > batch_size:
+                # 从回放缓冲区采样
+                states, actions, rewards, next_states, dones = replay_buffer.sample(batch_size)
+                
+                # 为计算梯度，重新执行动作并获取奖励
+                optimizer.zero_grad()
+                
+                # 为了建立计算图，重新训练每个动作获取与模型参数相关的奖励
+                calculated_rewards = []
+                
+                for i in range(batch_size):
+                    try:
+                        sample_action = actions[i]
+                        # 使用eval_mode=True，仅计算奖励而不更新环境状态
+                        _, calculated_reward, _, _ = env.step(sample_action, eval_mode=True)
+                        
+                        # 确保奖励是有效的张量
+                        if isinstance(calculated_reward, torch.Tensor) and calculated_reward.numel() > 0:
+                            calculated_rewards.append(calculated_reward)
+                    except Exception as e:
+                        logger.debug(f"计算奖励 {i} 时出错: {e}")
+                
+                # 计算损失并更新参数
+                if calculated_rewards:
+                    try:
+                        # 处理不同形状的张量
+                        if all(r.dim() == 0 for r in calculated_rewards):
+                            # 所有张量都是标量，可以用cat
+                            rewards_tensor = torch.cat([r.unsqueeze(0) for r in calculated_rewards])
+                        else:
+                            # 张量形状不同，展平并连接
+                            rewards_tensor = torch.cat([r.view(-1) for r in calculated_rewards])
+                        
+                        # 计算损失 - 我们要最大化奖励，所以取负
+                        loss = -torch.mean(rewards_tensor)
+                        
+                        # 反向传播
+                        loss.backward()
+                        
+                        # 应用梯度
+                        optimizer.step()
+                        
+                        logger.debug(f"计算了损失值: {loss.item():.4f}，来自 {len(calculated_rewards)} 个奖励样本")
+                    except Exception as e:
+                        logger.warning(f"损失计算出错: {e}")
+                
+                # 如果启用了基于奖励的参数更新，直接修改参数
+                if use_reward_update:
+                    try:
+                        # 使用原始rewards（不是计算图连接的）
+                        valid_rewards = [r for r in rewards if isinstance(r, torch.Tensor) and r.numel() > 0]
+                        if valid_rewards:
+                            avg_reward = sum(r.item() for r in valid_rewards) / len(valid_rewards)
+                            # 使用奖励信号更新参数
+                            update_projection_params(projection_params, avg_reward, lr_scale=0.005)
+                    except Exception as e:
+                        logger.warning(f"参数更新出错: {e}")
+            
+            state = next_state
+            episode_reward += reward
+            total_steps += 1
+            
+            # 显示进度
+            if total_steps % 50 == 0:
+                logger.debug(f"Episode {episode+1}/{num_episodes}, Step {total_steps}, Reward: {reward.item():.4f}")
+        
+        # 更新探索率
+        current_epsilon = max(min_epsilon, current_epsilon * epsilon_decay)
+        
+        # 记录回合奖励
+        if isinstance(episode_reward, torch.Tensor):
+            episode_rewards.append(episode_reward.item())
+        else:
+            episode_rewards.append(float(episode_reward))
+        
+        # 输出当前进度
+        if (episode + 1) % 10 == 0 or episode == 0:
+            logger.info(f"Episode {episode+1}/{num_episodes} 完成。总奖励: {episode_rewards[-1]:.4f}, 探索率: {current_epsilon:.4f}")
+        
+        # 每隔一定回合保存模型
+        if (episode + 1) % 50 == 0 or (episode + 1) == num_episodes:
+            model_save_path = os.path.join(save_dir, f"model_ep{episode+1}.pt")
+            torch.save(model.state_dict(), model_save_path)
+            logger.info(f"模型已保存至 {model_save_path}")
+    
+    # 训练完成后保存最终模型
+    final_model_path = os.path.join(save_dir, "model_final.pt")
+    torch.save(model.state_dict(), final_model_path)
+    logger.info(f"最终模型已保存至 {final_model_path}")
+    
+    # 保存奖励历史
+    reward_path = os.path.join(save_dir, "rewards.npy")
+    np.save(reward_path, np.array(episode_rewards))
+    
+    # 输出训练统计信息
+    avg_reward = sum(episode_rewards) / len(episode_rewards) if episode_rewards else 0
+    logger.info(f"训练完成! 总步数: {total_steps}, 平均奖励: {avg_reward:.4f}")
+    
+    return model, episode_rewards
+
 def main(args):
     # 初始化日志
     logger = setup_logger()
@@ -182,299 +487,16 @@ def main(args):
         img_size=args.img_size
     )
     
-    # 获取类别文本特征
-    logger.info("获取CLIP文本特征...")
-    text_embeddings = get_text_embeddings(class_names, semantic_dim=args.semantic_dim, device=device)
-    
-    # 加载预训练模型
-    logger.info(f"加载预训练模型: {args.model}")
-    model = Model(args.model)
-    
     # 创建保存目录
     os.makedirs(args.save_dir, exist_ok=True)
     
     # 设置奖励权重
     reward_weights = {'accuracy': 0.6, 'semantic': 0.3, 'exploration': 0.1}
     
-    # 创建一个包装函数来修复train_rl中的问题
-    def train_rl_fixed(*args, **kwargs):
-        """修复版的train_rl函数，处理张量堆叠问题"""
-        # 修改trainer.py中的函数
-        original_train_rl = train_rl
-        
-        # 保存原始函数的代码
-        original_code = original_train_rl.__code__
-        
-        # 运行原始函数，但捕获特定错误
-        try:
-            return original_train_rl(*args, **kwargs)
-        except RuntimeError as e:
-            if "stack expects each tensor to be equal size" in str(e):
-                logger.warning("捕获到tensor stack错误，尝试使用修复版本...")
-                
-                # 手动进行强化学习训练
-                # 提取参数
-                model_path = kwargs.get('model_path')
-                yaml_path = kwargs.get('yaml_path')
-                dataset = kwargs.get('dataset')
-                class_names = kwargs.get('class_names')
-                num_episodes = kwargs.get('num_episodes', 100)
-                learning_rate = kwargs.get('learning_rate', 1e-4)
-                batch_size = kwargs.get('batch_size', 32)
-                semantic_dim = kwargs.get('semantic_dim', 512)
-                reward_weights = kwargs.get('reward_weights', {'accuracy': 0.6, 'semantic': 0.3, 'exploration': 0.1})
-                reward_scale = kwargs.get('reward_scale', 10.0)
-                save_dir = kwargs.get('save_dir', 'runs/rl_train')
-                device = kwargs.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
-                use_reward_update = kwargs.get('use_reward_update', True)
-                
-                from ultralytics.engine.model import Model
-                from trainer import (
-                    setup_logger, register_custom_modules, get_text_embeddings,
-                    DetectionRLEnv, ReplayBuffer, update_projection_params
-                )
-                
-                # 初始化日志
-                logger = setup_logger()
-                
-                # 首先注册自定义模块
-                register_custom_modules()
-                
-                # 获取类别文本特征
-                text_embeddings = get_text_embeddings(class_names, semantic_dim, device)
-                
-                # 加载预训练模型
-                model = Model(model_path)
-                
-                # 确保模型在正确的设备上
-                model.model = model.model.to(device)
-                
-                # 检测头的通道数
-                ch_list = []
-                last_layer = model.model.model[-1]
-                if hasattr(last_layer, 'reg_conv') and isinstance(last_layer.reg_conv, nn.ModuleList):
-                    for conv in last_layer.reg_conv:
-                        if hasattr(conv, 'in_channels'):
-                            ch_list.append(conv.in_channels)
-                
-                if not ch_list:
-                    logger.warning("无法从检测头确定通道数，使用默认值[64, 128, 256]")
-                    ch_list = [64, 128, 256]
-                
-                # 创建RL环境
-                env = DetectionRLEnv(
-                    model=model.model,
-                    text_embeddings=text_embeddings,
-                    dataset=dataset,
-                    semantic_dim=semantic_dim,
-                    reward_weights=reward_weights,
-                    reward_scale=reward_scale,
-                    device=device,
-                    ch_list=ch_list
-                )
-                
-                # 定义投影层优化器
-                projection_params = []
-                detection_head = model.model.model[-1]
-                
-                # 收集语义投影层参数
-                if hasattr(detection_head, 'semantic_projection'):
-                    logger.info(f"找到semantic_projection层，添加参数...")
-                    projection_params.extend(list(detection_head.semantic_projection.parameters()))
-                
-                if hasattr(detection_head, 'semantic_extract'):
-                    logger.info(f"找到semantic_extract层，添加参数...")
-                    for extract_module in detection_head.semantic_extract:
-                        params = list(extract_module.parameters())
-                        projection_params.extend(params)
-                
-                # 搜索可能的语义相关层
-                if not projection_params:
-                    logger.warning("未找到标准语义层，搜索其他可能的语义相关层...")
-                    # 搜索所有可能的线性层或卷积层作为语义相关层
-                    for name, module in detection_head.named_modules():
-                        if isinstance(module, (nn.Linear, nn.Conv2d)):
-                            params = list(module.parameters())
-                            if params:
-                                logger.info(f"找到可能的语义层 {name}，添加 {len(params)} 个参数")
-                                projection_params.extend(params)
-                
-                # 如果仍然没有参数，创建一个新的语义投影层
-                if not projection_params:
-                    logger.warning("未找到任何可训练参数，创建自定义语义投影层...")
-                    # 创建一个简单的语义投影层
-                    semantic_proj = nn.Sequential(
-                        nn.Linear(semantic_dim, semantic_dim * 2),
-                        nn.ReLU(),
-                        nn.Linear(semantic_dim * 2, semantic_dim)
-                    ).to(device)
-                    
-                    # 将投影层添加到模型中
-                    model.semantic_proj = semantic_proj
-                    
-                    # 添加参数
-                    projection_params.extend(list(semantic_proj.parameters()))
-                    
-                    logger.info(f"创建了自定义语义投影层，参数数量: {len(projection_params)}")
-                
-                # 检查参数数量
-                if not projection_params:
-                    # 如果仍然没有参数，创建一个虚拟参数以避免优化器错误
-                    logger.warning("仍然没有找到参数，创建虚拟参数...")
-                    dummy_param = nn.Parameter(torch.zeros(1, requires_grad=True, device=device))
-                    model.dummy_param = dummy_param
-                    projection_params.append(dummy_param)
-                
-                # 输出参数统计
-                logger.info(f"总共找到 {len(projection_params)} 个可训练参数")
-                
-                # 创建优化器
-                optimizer = torch.optim.Adam(projection_params, lr=learning_rate)
-                
-                # 创建经验回放缓冲区
-                replay_buffer = ReplayBuffer()
-                
-                # RL训练循环
-                total_steps = 0
-                episode_rewards = []
-                epsilon = 0.3  # 初始探索率
-                
-                # 使用tqdm进度条
-                for episode in tqdm(range(num_episodes), desc="Training RL", unit="episode"):
-                    # 重置环境
-                    state = env.reset()
-                    episode_reward = 0
-                    done = False
-                    
-                    while not done:
-                        # 探索或利用
-                        if np.random.random() < epsilon:
-                            # 探索
-                            action = []
-                            for ch in env.ch_list:
-                                action.append(torch.randn(ch, semantic_dim, device=env.device))
-                        else:
-                            # 利用
-                            with torch.no_grad():
-                                # 获取语义投影层的权重
-                                action = []
-                                detection_head = model.model.model[-1]
-                                
-                                # 尝试提取投影矩阵
-                                if hasattr(detection_head, 'semantic_projection'):
-                                    for name, param in detection_head.semantic_projection.named_parameters():
-                                        if 'weight' in name and '0.weight' in name:
-                                            action.append(param.t())
-                                            break
-                                
-                                if not action and hasattr(detection_head, 'semantic_extract'):
-                                    for extract in detection_head.semantic_extract:
-                                        for m in extract.modules():
-                                            if isinstance(m, torch.nn.Conv2d) and m.out_channels == semantic_dim:
-                                                weight = m.weight.data
-                                                proj_matrix = weight.view(weight.shape[0], weight.shape[1], -1).mean(dim=2).t()
-                                                action.append(proj_matrix)
-                                
-                                # 如果以上方法都失败，使用随机初始化
-                                if not action:
-                                    for ch in env.ch_list:
-                                        action.append(torch.randn(ch, semantic_dim, device=env.device))
-                                
-                                # 确保创建足够的矩阵
-                                while len(action) < len(env.ch_list):
-                                    ch = env.ch_list[len(action)]
-                                    action.append(torch.randn(ch, semantic_dim, device=env.device))
-                        
-                        # 执行动作
-                        next_state, reward, done, info = env.step(action)
-                        
-                        # 存储经验
-                        replay_buffer.push(state, action, reward, next_state, done)
-                        
-                        # 经验回放学习
-                        if len(replay_buffer) > batch_size:
-                            # 从回放缓冲区采样
-                            states, actions, rewards, next_states, dones = replay_buffer.sample(batch_size)
-                            
-                            # 为计算梯度，重新执行动作并获取奖励
-                            optimizer.zero_grad()
-                            
-                            # 为了建立计算图，重新训练每个动作获取与模型参数相关的奖励
-                            calculated_rewards = []
-                            for i in range(batch_size):
-                                sample_action = actions[i]
-                                
-                                try:
-                                    _, calculated_reward, _, _ = env.step(sample_action, eval_mode=True)
-                                    calculated_rewards.append(calculated_reward)
-                                except Exception as e:
-                                    logger.warning(f"计算奖励时出错: {e}")
-                            
-                            # 修复：过滤掉空或无效的奖励
-                            calculated_rewards = [r for r in calculated_rewards if isinstance(r, torch.Tensor) and r.numel() > 0]
-                            
-                            # 使用有计算图的奖励计算损失
-                            if calculated_rewards:
-                                try:
-                                    # 检查所有张量的形状
-                                    shapes = [r.shape for r in calculated_rewards]
-                                    all_same_shape = all(s == shapes[0] for s in shapes)
-                                    
-                                    if all_same_shape:
-                                        # 形状相同，使用stack
-                                        calculated_rewards_tensor = torch.stack(calculated_rewards)
-                                    else:
-                                        # 形状不同，使用flatten和cat
-                                        calculated_rewards_tensor = torch.cat([r.view(-1) for r in calculated_rewards])
-                                    
-                                    # 计算损失
-                                    loss = -torch.mean(calculated_rewards_tensor)
-                                    
-                                    # 执行反向传播
-                                    loss.backward()
-                                except Exception as e:
-                                    logger.warning(f"损失计算出错: {e}")
-                            
-                            # 标准梯度更新
-                            optimizer.step()
-                            
-                            # 如果启用了基于奖励的参数更新，直接修改参数
-                            if use_reward_update:
-                                # 计算平均奖励
-                                avg_reward = sum(r.item() for r in rewards if isinstance(r, torch.Tensor)) / len(rewards)
-                                # 使用奖励信号更新参数
-                                update_projection_params(projection_params, avg_reward, lr_scale=0.005)
-                        
-                        state = next_state
-                        episode_reward += reward
-                        total_steps += 1
-                        
-                        # 显示进度
-                        if total_steps % 50 == 0:
-                            logger.debug(f"Episode {episode+1}/{num_episodes}, Step {total_steps}, Reward: {reward.item():.4f}")
-                    
-                    # 更新探索率
-                    epsilon = max(0.05, epsilon * 0.995)
-                    
-                    # 记录回合奖励
-                    episode_rewards.append(episode_reward.item())
-                    
-                    # 每隔一定回合保存模型
-                    if (episode + 1) % 50 == 0:
-                        model_save_path = os.path.join(save_dir, f"model_ep{episode+1}.pt")
-                        torch.save(model.state_dict(), model_save_path)
-                        logger.info(f"Model saved to {model_save_path}")
-                
-                # 训练完成
-                return model, episode_rewards
-            else:
-                # 如果是其他错误，重新抛出
-                raise
-    
-    # 开始强化学习训练
+    # 开始强化学习训练 - 使用我们直接实现的RL训练函数
     logger.info("开始强化学习训练...")
     try:
-        model_out, rewards = train_rl_fixed(
+        model_out, rewards = train_rl_direct(
             model_path=args.model,
             yaml_path=modified_yaml,
             dataset=train_dataset,
@@ -493,11 +515,6 @@ def main(args):
             device=device,
             use_reward_update=True
         )
-        
-        # 保存最终模型
-        final_model_path = os.path.join(args.save_dir, "model_final.pt")
-        torch.save(model_out.state_dict(), final_model_path)
-        logger.info(f"训练完成，最终模型已保存至: {final_model_path}")
         
         # 保存奖励历史
         reward_path = os.path.join(args.save_dir, "rewards.npy")
