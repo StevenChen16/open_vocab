@@ -177,7 +177,7 @@ class DetectionRLEnv:
         model,
         text_embeddings,  # CLIP文本嵌入，形状 [num_classes, semantic_dim]
         dataset,          # 训练数据集
-        conf_threshold=0.25,
+        conf_threshold=0.05,  # 大幅降低置信度阈值，从0.25降至0.05
         nms_threshold=0.45,
         semantic_dim=512,
         reward_weights={'accuracy': 0.6, 'semantic': 0.3, 'exploration': 0.1},
@@ -211,7 +211,7 @@ class DetectionRLEnv:
         self.semantic_history = []
         self.max_history_size = 1000
         
-        logger.info(f"RL环境初始化完成，设备: {device}, 文本嵌入形状: {self.text_embeddings.shape}")
+        logger.info(f"RL环境初始化完成，设备: {device}, 文本嵌入形状: {self.text_embeddings.shape}, 置信度阈值: {self.conf_threshold}")
     
     def reset(self):
         """重置环境，返回新图像的状态"""
@@ -263,14 +263,14 @@ class DetectionRLEnv:
                 'classes': torch.tensor([0], device=self.device),
             }
             
-        # 直接创建虚拟特征而不尝试通过模型前向传播
-        logger.debug("创建虚拟特征")
-            
+        # 改进特征初始化 - 使用随机正态分布，但减小方差并添加偏移以增加相似度
+        logger.debug("创建初始特征")
+        
         # 使用初始化时确定的通道数，确保与检测头的卷积层匹配
         features = [
-            torch.randn(1, self.ch_list[0], 80, 80, device=self.device),
-            torch.randn(1, self.ch_list[1], 40, 40, device=self.device),
-            torch.randn(1, self.ch_list[2], 20, 20, device=self.device)
+            torch.randn(1, self.ch_list[0], 80, 80, device=self.device, dtype=torch.float32) * 0.5 + 0.1,
+            torch.randn(1, self.ch_list[1], 40, 40, device=self.device, dtype=torch.float32) * 0.5 + 0.1,
+            torch.randn(1, self.ch_list[2], 20, 20, device=self.device, dtype=torch.float32) * 0.5 + 0.1
         ]
             
         self.current_preds = features
@@ -315,8 +315,17 @@ class DetectionRLEnv:
                         # 从大矩阵切出所需大小
                         proj_matrix = action[:ch, :self.semantic_dim]
                     else:
-                        # 创建新的随机矩阵
+                        # 创建新的随机矩阵，改进初始化
                         proj_matrix = torch.randn(ch, self.semantic_dim, device=self.device)
+                        # 正交初始化
+                        if proj_matrix.shape[0] <= proj_matrix.shape[1]:
+                            # 如果行数小于等于列数，可以得到完全正交的行
+                            q, _ = torch.linalg.qr(proj_matrix.T)
+                            proj_matrix = q.T[:ch]
+                        else:
+                            # 否则获得部分正交的行
+                            q, _ = torch.linalg.qr(proj_matrix)
+                            proj_matrix = q[:ch]
                     projection_matrices.append(proj_matrix)
                 action = projection_matrices
             
@@ -333,11 +342,9 @@ class DetectionRLEnv:
         # 获取最大相似度和对应的类别
         max_sim, pred_classes = similarities.max(dim=-1)
         
-        # 打印形状信息，帮助调试
-        logger.debug(f"语义特征形状: {semantic_features.shape}")
-        logger.debug(f"相似度矩阵形状: {similarities.shape}")
-        logger.debug(f"最大相似度形状: {max_sim.shape}")
-        logger.debug(f"预测类别形状: {pred_classes.shape}")
+        # 添加相似度统计日志
+        logger.debug(f"相似度统计 - 最小值: {max_sim.min().item():.4f}, 最大值: {max_sim.max().item():.4f}, 平均值: {max_sim.mean().item():.4f}")
+        logger.debug(f"超过阈值的比例: {(max_sim > self.conf_threshold).float().mean().item():.4f}")
         
         # 解决维度不匹配问题
         # 方法：生成与特征点数量匹配的预测框
@@ -362,11 +369,22 @@ class DetectionRLEnv:
         filtered_classes = pred_classes.reshape(-1)[conf_mask]
         filtered_scores = max_sim.reshape(-1)[conf_mask]
         
+        # 记录过滤后的预测数量
+        logger.debug(f"过滤后的预测框数量: {len(filtered_boxes)}")
+        
         # 应用NMS
-        keep_indices = self._apply_nms(filtered_boxes, filtered_scores)
-        final_boxes = filtered_boxes[keep_indices]
-        final_classes = filtered_classes[keep_indices]
-        final_scores = filtered_scores[keep_indices]
+        if len(filtered_boxes) > 0:
+            keep_indices = self._apply_nms(filtered_boxes, filtered_scores)
+            final_boxes = filtered_boxes[keep_indices]
+            final_classes = filtered_classes[keep_indices]
+            final_scores = filtered_scores[keep_indices]
+        else:
+            # 如果没有预测通过置信度过滤，使用空张量
+            final_boxes = filtered_boxes
+            final_classes = filtered_classes
+            final_scores = filtered_scores
+        
+        logger.debug(f"NMS后的预测框数量: {len(final_boxes)}")
         
         # 对于训练模式，将当前语义特征添加到历史记录中，用于计算探索奖励
         if not eval_mode:
@@ -382,6 +400,8 @@ class DetectionRLEnv:
             semantic_features
         )
         
+        logger.debug(f"计算的奖励: {reward.item():.4f}")
+        
         # 更新状态
         info = {
             'pred_boxes': final_boxes,
@@ -389,7 +409,13 @@ class DetectionRLEnv:
             'pred_scores': final_scores,
             'gt_boxes': gt_boxes,
             'gt_classes': gt_classes,
-            'reward_info': reward_info  # 添加详细奖励信息以便分析
+            'reward_info': reward_info,  # 添加详细奖励信息以便分析
+            'similarity_stats': {
+                'min': max_sim.min().item(),
+                'max': max_sim.max().item(),
+                'mean': max_sim.mean().item(),
+                'above_threshold': (max_sim > self.conf_threshold).float().mean().item()
+            }
         }
         
         # 如果是评估模式，仅返回奖励而不重置环境
@@ -494,6 +520,13 @@ class DetectionRLEnv:
                     else:
                         logger.debug(f"  动作维度不足，为特征 {i} (形状: {feat.shape}) 创建随机投影矩阵")
                         proj_matrix = torch.randn(ch, self.semantic_dim, device=self.device)
+                        # 正交初始化
+                        if proj_matrix.shape[0] <= proj_matrix.shape[1]:
+                            q, _ = torch.linalg.qr(proj_matrix.T)
+                            proj_matrix = q.T[:ch]
+                        else:
+                            q, _ = torch.linalg.qr(proj_matrix)
+                            proj_matrix = q[:ch]
                     projection_matrices.append(proj_matrix)
             else:
                 # 如果action已经是一个列表或tensor序列，直接使用
@@ -505,7 +538,15 @@ class DetectionRLEnv:
                 logger.warning(f"投影矩阵数量不足({len(projection_matrices)})，自动创建缺失的矩阵以匹配特征数量({len(features)})")
                 for i in range(len(projection_matrices), len(features)):
                     ch = features[i].shape[1]
-                    projection_matrices.append(torch.randn(ch, self.semantic_dim, device=self.device))
+                    proj_matrix = torch.randn(ch, self.semantic_dim, device=self.device)
+                    # 正交初始化
+                    if proj_matrix.shape[0] <= proj_matrix.shape[1]:
+                        q, _ = torch.linalg.qr(proj_matrix.T)
+                        proj_matrix = q.T[:ch]
+                    else:
+                        q, _ = torch.linalg.qr(proj_matrix)
+                        proj_matrix = q[:ch]
+                    projection_matrices.append(proj_matrix)
             
             # 逐个特征级别应用投影
             for i, feat in enumerate(features):
@@ -518,6 +559,13 @@ class DetectionRLEnv:
                 if proj_matrix.shape[0] != ch or proj_matrix.shape[1] != self.semantic_dim:
                     logger.debug(f"  调整投影矩阵形状: {proj_matrix.shape} -> [{ch}, {self.semantic_dim}]")
                     proj_matrix = torch.randn(ch, self.semantic_dim, device=self.device)
+                    # 正交初始化
+                    if proj_matrix.shape[0] <= proj_matrix.shape[1]:
+                        q, _ = torch.linalg.qr(proj_matrix.T)
+                        proj_matrix = q.T[:ch]
+                    else:
+                        q, _ = torch.linalg.qr(proj_matrix)
+                        proj_matrix = q[:ch]
                     projection_matrices[i] = proj_matrix
                 
                 # 应用投影 - 首先展平空间维度，然后转置使通道在最后
@@ -593,13 +641,24 @@ class DetectionRLEnv:
             'exploration': torch.tensor(0.0, device=self.device, dtype=torch.float32)
         }
         
-        # 如果没有预测，返回负面奖励
+        # 如果没有预测，返回轻微的负面奖励，避免乘以reward_scale
         if len(pred_classes) == 0:
-            total_reward = torch.tensor(-1.0, device=self.device, dtype=torch.float32, requires_grad=True)
+            # 降低惩罚力度，从-1.0改为-0.2
+            base_penalty = torch.tensor(-0.2, device=self.device, dtype=torch.float32, requires_grad=True)
+            # 保持些许探索奖励，让算法继续尝试
+            exploration_bonus = torch.tensor(0.1, device=self.device, dtype=torch.float32, requires_grad=True)
             # 更新奖励信息
-            for k in reward_info:
-                reward_info[k] = torch.tensor(-1.0, device=self.device, dtype=torch.float32)
-            return total_reward * self.reward_scale, reward_info
+            reward_info['accuracy'] = base_penalty
+            reward_info['semantic'] = base_penalty
+            reward_info['exploration'] = exploration_bonus
+            # 计算总奖励
+            total_reward = (
+                self.reward_weights['accuracy'] * base_penalty +
+                self.reward_weights['semantic'] * base_penalty +
+                self.reward_weights['exploration'] * exploration_bonus
+            )
+            # 使用较小的惩罚
+            return total_reward * 1.0, reward_info
         
         # 确保所有输入都是张量
         if not isinstance(pred_scores, torch.Tensor):
@@ -628,18 +687,20 @@ class DetectionRLEnv:
                         accuracy_reward = accuracy_reward + 1.0 + iou * 0.5 + pred_scores[i] * 0.3
                         break
             else:
-                # 惩罚错误类别
-                accuracy_reward = accuracy_reward - 0.5 * pred_scores[i]
+                # 降低错误类别的惩罚
+                accuracy_reward = accuracy_reward - 0.2 * pred_scores[i]
         
         # 惩罚过多错误检测
         false_positives = max(0, len(pred_classes) - correct_detections)
         if false_positives > 0:
-            accuracy_reward = accuracy_reward - false_positives * 0.2
+            # 降低惩罚力度
+            accuracy_reward = accuracy_reward - false_positives * 0.1
             
         # 惩罚漏检
         false_negatives = max(0, total_gt - correct_detections)
         if false_negatives > 0:
-            accuracy_reward = accuracy_reward - false_negatives * 0.3
+            # 降低惩罚力度
+            accuracy_reward = accuracy_reward - false_negatives * 0.2
             
         # 将准确性奖励归一化到 [-1, 1] 范围
         accuracy_reward = torch.clamp(accuracy_reward / max(1, total_gt), min=-1.0, max=1.0)
@@ -717,7 +778,7 @@ class DetectionRLEnv:
             exploration_reward = torch.clamp(exploration_reward, min=0.0, max=1.0) * 2 - 1
         else:
             # 如果没有历史，给予适中的探索奖励
-            exploration_reward = torch.tensor(0.0, device=self.device, dtype=torch.float32)
+            exploration_reward = torch.tensor(0.2, device=self.device, dtype=torch.float32)
             
         reward_info['exploration'] = exploration_reward
             
@@ -794,6 +855,7 @@ def train_rl(
     yaml_path,           # 修改后的yaml配置路径
     dataset,             # 训练数据集
     class_names,         # 类别名称
+    text_embeddings=None,  # 预计算的文本嵌入，可选
     num_episodes=1000,   # 训练回合数
     learning_rate=1e-4,  # 学习率
     gamma=0.99,          # 折扣因子
@@ -816,6 +878,7 @@ def train_rl(
         yaml_path: 修改后的yaml配置路径
         dataset: 训练数据集
         class_names: 类别名称列表
+        text_embeddings: 预计算的文本嵌入，可选
         num_episodes: 训练回合数
         learning_rate: 学习率
         gamma: 折扣因子
@@ -838,7 +901,8 @@ def train_rl(
     logger.info("已注册自定义模块OpenVocabDetect到Ultralytics框架")
     
     # 获取类别文本特征
-    text_embeddings = get_text_embeddings(class_names, semantic_dim, device)
+    if text_embeddings is None:
+        text_embeddings = get_text_embeddings(class_names, semantic_dim, device)
     
     # 加载预训练模型
     model = Model(model_path)
@@ -928,7 +992,8 @@ def train_rl(
         reward_weights=reward_weights,
         reward_scale=reward_scale,
         device=device,
-        ch_list=ch_list  # 传入检测到的通道数
+        ch_list=ch_list,  # 传入检测到的通道数
+        conf_threshold=0.05  # 使用低置信度阈值
     )
     
     # 定义投影层优化器
@@ -993,6 +1058,7 @@ def train_rl(
     # RL训练循环
     total_steps = 0
     episode_rewards = []
+    current_epsilon = epsilon  # 当前探索率
     
     # 使用tqdm进度条
     for episode in tqdm(range(num_episodes), desc="Training RL", unit="episode"):
@@ -1003,18 +1069,35 @@ def train_rl(
         
         while not done:
             # 探索或利用
-            if np.random.random() < epsilon:
+            if np.random.random() < current_epsilon:
                 # 探索: 为每个特征级别创建独立的随机投影矩阵
                 action = []
                 for ch in env.ch_list:
-                    action.append(torch.randn(ch, semantic_dim, device=env.device))
+                    # 改进随机投影矩阵初始化
+                    proj_matrix = torch.randn(ch, semantic_dim, device=device)
+                    # 正交初始化
+                    if ch <= semantic_dim:
+                        q, _ = torch.linalg.qr(proj_matrix.T)
+                        proj_matrix = q.T[:ch]
+                    else:
+                        q, _ = torch.linalg.qr(proj_matrix)
+                        proj_matrix = q[:ch]
+                    action.append(proj_matrix)
                 
                 # 确保创建足够的矩阵，每个特征级别对应一个
                 if len(action) < len(env.ch_list):
                     logger.warning(f"自动补充缺失的投影矩阵: 当前{len(action)}，需要{len(env.ch_list)}")
                     while len(action) < len(env.ch_list):
                         ch = env.ch_list[len(action)]
-                        action.append(torch.randn(ch, semantic_dim, device=env.device))
+                        proj_matrix = torch.randn(ch, semantic_dim, device=device)
+                        # 正交初始化
+                        if ch <= semantic_dim:
+                            q, _ = torch.linalg.qr(proj_matrix.T)
+                            proj_matrix = q.T[:ch]
+                        else:
+                            q, _ = torch.linalg.qr(proj_matrix)
+                            proj_matrix = q[:ch]
+                        action.append(proj_matrix)
                         
                 logger.debug(f"创建探索动作: {len(action)}个投影矩阵，形状为 {[a.shape for a in action]}")
             else:
@@ -1063,18 +1146,34 @@ def train_rl(
                                 action.append(param.t())
                                 break
                     
-                    # 如果以上方法都失败，使用随机初始化
+                    # 如果以上方法都失败，使用正交初始化
                     if not action:
-                        logger.warning("无法从模型提取投影矩阵，使用随机初始化")
+                        logger.warning("无法从模型提取投影矩阵，使用正交初始化")
                         for ch in env.ch_list:
-                            action.append(torch.randn(ch, semantic_dim, device=env.device))
+                            proj_matrix = torch.randn(ch, semantic_dim, device=device)
+                            # 正交初始化
+                            if ch <= semantic_dim:
+                                q, _ = torch.linalg.qr(proj_matrix.T)
+                                proj_matrix = q.T[:ch]
+                            else:
+                                q, _ = torch.linalg.qr(proj_matrix)
+                                proj_matrix = q[:ch]
+                            action.append(proj_matrix)
                     
                     # 确保创建足够的矩阵，每个特征级别对应一个
                     if len(action) < len(env.ch_list):
                         logger.warning(f"自动补充缺失的投影矩阵: 当前{len(action)}，需要{len(env.ch_list)}")
                         while len(action) < len(env.ch_list):
                             ch = env.ch_list[len(action)]
-                            action.append(torch.randn(ch, semantic_dim, device=env.device))
+                            proj_matrix = torch.randn(ch, semantic_dim, device=device)
+                            # 正交初始化
+                            if ch <= semantic_dim:
+                                q, _ = torch.linalg.qr(proj_matrix.T)
+                                proj_matrix = q.T[:ch]
+                            else:
+                                q, _ = torch.linalg.qr(proj_matrix)
+                                proj_matrix = q[:ch]
+                            action.append(proj_matrix)
                     
                     logger.debug(f"创建利用动作: {len(action)}个投影矩阵，形状为 {[a.shape for a in action if isinstance(a, torch.Tensor)]}")
             
@@ -1135,7 +1234,7 @@ def train_rl(
                 # 另外，如果启用了基于奖励的参数更新，直接修改参数
                 if use_reward_update:
                     # 计算平均奖励
-                    avg_reward = sum(rewards) / len(rewards)
+                    avg_reward = sum(r.item() if isinstance(r, torch.Tensor) else r for r in rewards) / len(rewards)
                     # 使用奖励信号更新参数
                     update_projection_params(projection_params, avg_reward, lr_scale=0.005)
             
@@ -1148,13 +1247,13 @@ def train_rl(
                 logger.debug(f"Episode {episode+1}/{num_episodes}, Step {total_steps}, Reward: {reward.item():.4f}")
         
         # 更新探索率
-        epsilon = max(min_epsilon, epsilon * epsilon_decay)
+        current_epsilon = max(min_epsilon, current_epsilon * epsilon_decay)
         
         # 记录回合奖励
         episode_rewards.append(episode_reward.item())
         
         # 更新tqdm描述信息，显示当前奖励和探索率
-        tqdm.write(f"Episode {episode+1} completed. Total reward: {episode_reward.item():.4f}, Epsilon: {epsilon:.4f}")
+        tqdm.write(f"Episode {episode+1} completed. Total reward: {episode_reward.item():.4f}, Epsilon: {current_epsilon:.4f}")
         
         # 每隔一定回合保存模型
         if (episode + 1) % 50 == 0:

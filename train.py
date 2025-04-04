@@ -109,14 +109,11 @@ def load_coco_dataset(data_yaml, img_size=640):
     
     # 如果提供了YAML文件，则加载它
     if os.path.exists(data_yaml):
-        try:
-            with open(data_yaml, 'r') as f:
-                yaml_dict = yaml.safe_load(f)
-                # 合并YAML配置
-                for k, v in yaml_dict.items():
-                    data_dict[k] = v
-        except Exception as e:
-            logger.warning(f"无法加载YAML配置文件 {data_yaml}: {e}")
+        with open(data_yaml, 'r') as f:
+            yaml_dict = yaml.safe_load(f)
+            # 合并YAML配置
+            for k, v in yaml_dict.items():
+                data_dict[k] = v
     
     logger.info(f"数据集路径: {data_dict['path']}")
     
@@ -228,7 +225,8 @@ def train_rl_direct(
         reward_weights=reward_weights,
         reward_scale=reward_scale,
         device=device,
-        ch_list=ch_list
+        ch_list=ch_list,
+        conf_threshold=0.05  # 使用较低的置信度阈值
     )
     logger.info("RL环境创建完成")
     
@@ -317,7 +315,19 @@ def train_rl_direct(
                 # 探索: 创建随机投影矩阵
                 action = []
                 for ch in env.ch_list:
-                    action.append(torch.randn(ch, semantic_dim, device=device))
+                    # 改进随机投影矩阵初始化
+                    proj_matrix = torch.randn(ch, semantic_dim, device=device)
+                    # 正交初始化
+                    if ch <= semantic_dim:
+                        q, _ = torch.linalg.qr(proj_matrix.T)
+                        proj_matrix = q.T[:ch]
+                    else:
+                        q, _ = torch.linalg.qr(proj_matrix)
+                        proj_matrix = q[:ch]
+                    
+                    # 确保保持梯度
+                    proj_matrix = proj_matrix.detach().clone().requires_grad_(True)
+                    action.append(proj_matrix)
             else:
                 # 利用: 使用当前模型的投影参数
                 with torch.no_grad():
@@ -328,7 +338,9 @@ def train_rl_direct(
                     if hasattr(detection_head, 'semantic_projection'):
                         for name, param in detection_head.semantic_projection.named_parameters():
                             if 'weight' in name and '0.weight' in name:
-                                action.append(param.t())
+                                # 克隆参数并启用梯度
+                                proj_matrix = param.t().detach().clone().requires_grad_(True)
+                                action.append(proj_matrix)
                                 break
                     
                     if not action and hasattr(detection_head, 'semantic_extract'):
@@ -337,28 +349,42 @@ def train_rl_direct(
                                 if isinstance(m, nn.Conv2d) and m.out_channels == semantic_dim:
                                     weight = m.weight.data
                                     proj_matrix = weight.view(weight.shape[0], weight.shape[1], -1).mean(dim=2).t()
+                                    # 克隆并启用梯度
+                                    proj_matrix = proj_matrix.detach().clone().requires_grad_(True)
                                     action.append(proj_matrix)
                     
                     # 如果以上方法都失败，使用随机初始化
                     if not action:
                         for ch in env.ch_list:
-                            action.append(torch.randn(ch, semantic_dim, device=device))
+                            proj_matrix = torch.randn(ch, semantic_dim, device=device)
+                            # 正交初始化
+                            if ch <= semantic_dim:
+                                q, _ = torch.linalg.qr(proj_matrix.T)
+                                proj_matrix = q.T[:ch]
+                            else:
+                                q, _ = torch.linalg.qr(proj_matrix)
+                                proj_matrix = q[:ch]
+                            # 确保保持梯度
+                            proj_matrix = proj_matrix.requires_grad_(True)
+                            action.append(proj_matrix)
                     
                     # 确保创建足够的矩阵
                     while len(action) < len(env.ch_list):
                         ch = env.ch_list[len(action)]
-                        action.append(torch.randn(ch, semantic_dim, device=device))
+                        proj_matrix = torch.randn(ch, semantic_dim, device=device)
+                        # 正交初始化
+                        if ch <= semantic_dim:
+                            q, _ = torch.linalg.qr(proj_matrix.T)
+                            proj_matrix = q.T[:ch]
+                        else:
+                            q, _ = torch.linalg.qr(proj_matrix)
+                            proj_matrix = q[:ch]
+                        # 确保保持梯度
+                        proj_matrix = proj_matrix.requires_grad_(True)
+                        action.append(proj_matrix)
             
             # 执行动作
-            try:
-                next_state, reward, done, info = env.step(action)
-            except Exception as e:
-                logger.warning(f"执行动作时出错: {e}")
-                # 创建默认返回值
-                next_state = state
-                reward = torch.tensor(-1.0, device=device)  # 负奖励
-                done = True
-                info = {}
+            next_state, reward, done, info = env.step(action)
             
             # 存储经验
             replay_buffer.push(state, action, reward, next_state, done)
@@ -371,56 +397,90 @@ def train_rl_direct(
                 # 为计算梯度，重新执行动作并获取奖励
                 optimizer.zero_grad()
                 
-                # 为了建立计算图，重新训练每个动作获取与模型参数相关的奖励
+                # 为了建立计算图，重新执行每个动作获取与模型参数相关的奖励
                 calculated_rewards = []
                 
                 for i in range(batch_size):
-                    try:
-                        sample_action = actions[i]
-                        # 使用eval_mode=True，仅计算奖励而不更新环境状态
-                        _, calculated_reward, _, _ = env.step(sample_action, eval_mode=True)
-                        
-                        # 确保奖励是有效的张量
-                        if isinstance(calculated_reward, torch.Tensor) and calculated_reward.numel() > 0:
+                    sample_action = actions[i]
+                    
+                    # 确保动作保持梯度
+                    if isinstance(sample_action, list):
+                        # 对于列表，确保每个矩阵都保持梯度
+                        sample_action_with_grad = []
+                        for mat in sample_action:
+                            # 确保每个矩阵都有梯度
+                            if isinstance(mat, torch.Tensor) and not mat.requires_grad:
+                                mat = mat.detach().clone().requires_grad_(True)
+                            sample_action_with_grad.append(mat)
+                        sample_action = sample_action_with_grad
+                    elif isinstance(sample_action, torch.Tensor) and not sample_action.requires_grad:
+                        # 对于单个张量，确保它有梯度
+                        sample_action = sample_action.detach().clone().requires_grad_(True)
+                    
+                    # 使用eval_mode=True，仅计算奖励而不更新环境状态
+                    _, calculated_reward, _, _ = env.step(sample_action, eval_mode=True)
+                    
+                    # 检查奖励是否有梯度信息
+                    if isinstance(calculated_reward, torch.Tensor):
+                        # 确保奖励保持梯度
+                        if not calculated_reward.requires_grad:
+                            logger.warning(f"奖励没有梯度信息，创建新的可导奖励")
+                            # 创建新的与原始奖励值相同但有梯度的张量
+                            proxy_reward = calculated_reward.detach().clone().requires_grad_(True)
+                            # 另一种方法是使用原始参数直接计算，确保保持梯度连接
+                            for action_tensor in sample_action:
+                                if action_tensor.requires_grad:
+                                    # 找到一个可导的参数，将其连接到奖励上
+                                    proxy_reward = proxy_reward + 0.0 * action_tensor.sum()
+                            calculated_rewards.append(proxy_reward)
+                        else:
                             calculated_rewards.append(calculated_reward)
-                    except Exception as e:
-                        logger.debug(f"计算奖励 {i} 时出错: {e}")
                 
                 # 计算损失并更新参数
                 if calculated_rewards:
-                    try:
-                        # 处理不同形状的张量
-                        if all(r.dim() == 0 for r in calculated_rewards):
-                            # 所有张量都是标量，可以用cat
-                            rewards_tensor = torch.cat([r.unsqueeze(0) for r in calculated_rewards])
-                        else:
-                            # 张量形状不同，展平并连接
-                            rewards_tensor = torch.cat([r.view(-1) for r in calculated_rewards])
-                        
-                        # 计算损失 - 我们要最大化奖励，所以取负
-                        loss = -torch.mean(rewards_tensor)
-                        
-                        # 反向传播
-                        loss.backward()
-                        
-                        # 应用梯度
-                        optimizer.step()
-                        
-                        logger.debug(f"计算了损失值: {loss.item():.4f}，来自 {len(calculated_rewards)} 个奖励样本")
-                    except Exception as e:
-                        logger.warning(f"损失计算出错: {e}")
+                    # 处理不同形状的张量
+                    if all(r.dim() == 0 for r in calculated_rewards):
+                        # 所有张量都是标量，可以用stack
+                        rewards_tensor = torch.stack(calculated_rewards)
+                    else:
+                        # 确保每个奖励都是标量
+                        rewards_tensor = torch.stack([r.mean() if r.dim() > 0 else r for r in calculated_rewards])
+                    
+                    # 计算损失 - 我们要最大化奖励，所以取负
+                    loss = -torch.mean(rewards_tensor)
+                    
+                    # 检查损失是否有梯度
+                    if not loss.requires_grad:
+                        logger.warning("损失没有梯度信息，无法反向传播")
+                        continue
+                    
+                    # 反向传播
+                    loss.backward()
+                    
+                    # 检查梯度
+                    grad_exists = False
+                    for param in projection_params:
+                        if param.grad is not None and torch.sum(torch.abs(param.grad)) > 0:
+                            grad_exists = True
+                            break
+                    
+                    if not grad_exists:
+                        logger.warning("没有产生有效梯度，跳过参数更新")
+                        continue
+                    
+                    # 应用梯度
+                    optimizer.step()
+                    
+                    logger.debug(f"计算了损失值: {loss.item():.4f}，来自 {len(calculated_rewards)} 个奖励样本")
                 
                 # 如果启用了基于奖励的参数更新，直接修改参数
                 if use_reward_update:
-                    try:
-                        # 使用原始rewards（不是计算图连接的）
-                        valid_rewards = [r for r in rewards if isinstance(r, torch.Tensor) and r.numel() > 0]
-                        if valid_rewards:
-                            avg_reward = sum(r.item() for r in valid_rewards) / len(valid_rewards)
-                            # 使用奖励信号更新参数
-                            update_projection_params(projection_params, avg_reward, lr_scale=0.005)
-                    except Exception as e:
-                        logger.warning(f"参数更新出错: {e}")
+                    # 使用原始rewards（不是计算图连接的）
+                    valid_rewards = [r for r in rewards if isinstance(r, torch.Tensor) and r.numel() > 0]
+                    if valid_rewards:
+                        avg_reward = sum(r.item() for r in valid_rewards) / len(valid_rewards)
+                        # 使用奖励信号更新参数
+                        update_projection_params(projection_params, avg_reward, lr_scale=0.005)
             
             state = next_state
             episode_reward += reward
@@ -495,49 +555,43 @@ def main(args):
     
     # 开始强化学习训练 - 使用我们直接实现的RL训练函数
     logger.info("开始强化学习训练...")
+    model_out, rewards = train_rl_direct(
+        model_path=args.model,
+        yaml_path=modified_yaml,
+        dataset=train_dataset,
+        class_names=class_names,
+        num_episodes=args.epochs,
+        learning_rate=1e-4,
+        gamma=0.99,
+        epsilon=0.3,
+        epsilon_decay=0.995,
+        min_epsilon=0.05,
+        batch_size=args.batch_size,
+        semantic_dim=args.semantic_dim,
+        reward_weights=reward_weights,
+        reward_scale=args.reward_scale,
+        save_dir=args.save_dir,
+        device=device,
+        use_reward_update=True
+    )
+    
+    # 保存奖励历史
+    reward_path = os.path.join(args.save_dir, "rewards.npy")
+    np.save(reward_path, rewards)
+    logger.info(f"奖励历史已保存至: {reward_path}")
+    
+    # 输出奖励曲线
     try:
-        model_out, rewards = train_rl_direct(
-            model_path=args.model,
-            yaml_path=modified_yaml,
-            dataset=train_dataset,
-            class_names=class_names,
-            num_episodes=args.epochs,
-            learning_rate=1e-4,
-            gamma=0.99,
-            epsilon=0.3,
-            epsilon_decay=0.995,
-            min_epsilon=0.05,
-            batch_size=args.batch_size,
-            semantic_dim=args.semantic_dim,
-            reward_weights=reward_weights,
-            reward_scale=args.reward_scale,
-            save_dir=args.save_dir,
-            device=device,
-            use_reward_update=True
-        )
-        
-        # 保存奖励历史
-        reward_path = os.path.join(args.save_dir, "rewards.npy")
-        np.save(reward_path, rewards)
-        logger.info(f"奖励历史已保存至: {reward_path}")
-        
-        # 输出奖励曲线
-        try:
-            import matplotlib.pyplot as plt
-            plt.figure(figsize=(10, 5))
-            plt.plot(rewards)
-            plt.title('Rewards during training')
-            plt.xlabel('Episode')
-            plt.ylabel('Reward')
-            plt.savefig(os.path.join(args.save_dir, 'reward_curve.png'))
-            logger.info("奖励曲线已保存")
-        except ImportError:
-            logger.warning("无法导入matplotlib，跳过绘制奖励曲线")
-        
-    except Exception as e:
-        logger.error(f"训练过程中发生错误: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
+        import matplotlib.pyplot as plt
+        plt.figure(figsize=(10, 5))
+        plt.plot(rewards)
+        plt.title('Rewards during training')
+        plt.xlabel('Episode')
+        plt.ylabel('Reward')
+        plt.savefig(os.path.join(args.save_dir, 'reward_curve.png'))
+        logger.info("奖励曲线已保存")
+    except ImportError:
+        logger.warning("无法导入matplotlib，跳过绘制奖励曲线")
     
     logger.info("训练流程已完成！")
 
