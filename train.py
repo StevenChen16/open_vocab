@@ -21,6 +21,15 @@ from trainer import (
     SemanticHead
 )
 
+# 从zero_shot_eval导入零样本评估组件
+from zero_shot_eval import (
+    BASE_CLASSES,
+    NOVEL_CLASSES,
+    FilteredDataset,
+    prepare_datasets,
+    run_evaluation
+)
+
 # 设置命令行参数
 def parse_args():
     parser = argparse.ArgumentParser(description="Train open-vocab detector with RL")
@@ -34,6 +43,8 @@ def parse_args():
     parser.add_argument('--save-dir', type=str, default='runs/train_openvocab', help='save directory')
     parser.add_argument('--semantic-dim', type=int, default=512, help='semantic feature dimension')
     parser.add_argument('--reward-scale', type=float, default=10.0, help='reward scaling factor')
+    parser.add_argument('--zero-shot', action='store_true', help='enable zero-shot evaluation')
+    parser.add_argument('--eval-interval', type=int, default=10, help='evaluation interval epochs')
     return parser.parse_args()
 
 # COCO数据集适配器
@@ -156,7 +167,7 @@ def load_coco_dataset(data_yaml, img_size=640):
     
     logger.info(f"训练集大小: {len(train_adapter)}, 验证集大小: {len(val_adapter)}")
     
-    return train_adapter, val_adapter, class_names
+    return train_adapter, val_adapter, class_names, train_dataset, val_dataset
 
 def train_rl_direct(
     model_path,          # 预训练模型路径
@@ -176,6 +187,9 @@ def train_rl_direct(
     save_dir='runs/rl_train', # 保存目录
     device='cuda' if torch.cuda.is_available() else 'cpu',  # 设备
     use_reward_update=True,  # 是否使用基于奖励的参数更新
+    zero_shot_eval=False,    # 是否启用零样本评估
+    eval_interval=10,        # 评估间隔
+    eval_datasets=None,      # 评估数据集
 ):
     """
     直接实现的RL训练函数，绕过原始train_rl函数的问题
@@ -508,6 +522,34 @@ def train_rl_direct(
             model_save_path = os.path.join(save_dir, f"model_ep{episode+1}.pt")
             torch.save(model.state_dict(), model_save_path)
             logger.info(f"模型已保存至 {model_save_path}")
+        
+        # 零样本评估
+        if zero_shot_eval and eval_datasets and (episode + 1) % eval_interval == 0:
+            logger.info(f"进行零样本评估 (Episode {episode+1})...")
+            eval_dir = os.path.join(save_dir, f"eval_ep{episode+1}")
+            os.makedirs(eval_dir, exist_ok=True)
+            
+            # 保存当前模型
+            current_model_path = os.path.join(eval_dir, "current_model.pt")
+            torch.save(model.state_dict(), current_model_path)
+            
+            # 执行评估 - 对基类和新类分别评估
+            base_results = run_evaluation(
+                model_path=current_model_path,
+                test_dataloader=eval_datasets['base'],
+                output_dir=os.path.join(eval_dir, "base_classes")
+            )
+            
+            novel_results = run_evaluation(
+                model_path=current_model_path,
+                test_dataloader=eval_datasets['novel'],
+                output_dir=os.path.join(eval_dir, "novel_classes")
+            )
+            
+            # 记录评估结果
+            base_f1 = base_results['detection']['base']['f1']
+            novel_f1 = novel_results['detection']['novel']['f1']
+            logger.info(f"零样本评估结果 - 基类F1: {base_f1:.4f}, 新类F1: {novel_f1:.4f}")
     
     # 训练完成后保存最终模型
     final_model_path = os.path.join(save_dir, "model_final.pt")
@@ -521,6 +563,31 @@ def train_rl_direct(
     # 输出训练统计信息
     avg_reward = sum(episode_rewards) / len(episode_rewards) if episode_rewards else 0
     logger.info(f"训练完成! 总步数: {total_steps}, 平均奖励: {avg_reward:.4f}")
+    
+    # 最终零样本评估
+    if zero_shot_eval and eval_datasets:
+        logger.info("进行最终零样本评估...")
+        eval_dir = os.path.join(save_dir, "final_evaluation")
+        os.makedirs(eval_dir, exist_ok=True)
+        
+        final_results = run_evaluation(
+            model_path=final_model_path,
+            test_dataloader=eval_datasets['novel'],
+            output_dir=eval_dir
+        )
+        
+        # 输出最终评估结果
+        base_precision = final_results['detection']['base']['precision']
+        base_recall = final_results['detection']['base']['recall']
+        base_f1 = final_results['detection']['base']['f1']
+        
+        novel_precision = final_results['detection']['novel']['precision']
+        novel_recall = final_results['detection']['novel']['recall']
+        novel_f1 = final_results['detection']['novel']['f1']
+        
+        logger.info("最终零样本评估结果:")
+        logger.info(f"基类 - 精确率: {base_precision:.4f}, 召回率: {base_recall:.4f}, F1: {base_f1:.4f}")
+        logger.info(f"新类 - 精确率: {novel_precision:.4f}, 召回率: {novel_recall:.4f}, F1: {novel_f1:.4f}")
     
     return model, episode_rewards
 
@@ -542,7 +609,7 @@ def main(args):
     
     # 加载数据集
     logger.info(f"加载COCO数据集: {args.data}")
-    train_dataset, val_dataset, class_names = load_coco_dataset(
+    train_dataset, val_dataset, class_names, raw_train_dataset, raw_val_dataset = load_coco_dataset(
         data_yaml=args.data,
         img_size=args.img_size
     )
@@ -552,6 +619,23 @@ def main(args):
     
     # 设置奖励权重
     reward_weights = {'accuracy': 0.6, 'semantic': 0.3, 'exploration': 0.1}
+    
+    # 准备零样本评估数据集
+    eval_datasets = None
+    if args.zero_shot:
+        logger.info("准备零样本评估数据集...")
+        train_loader, base_test_loader, novel_test_loader = prepare_datasets(
+            raw_train_dataset,
+            batch_size=args.batch_size,
+            num_workers=args.workers
+        )
+        
+        eval_datasets = {
+            'base': base_test_loader,
+            'novel': novel_test_loader
+        }
+        
+        logger.info(f"零样本评估数据集准备完成")
     
     # 开始强化学习训练 - 使用我们直接实现的RL训练函数
     logger.info("开始强化学习训练...")
@@ -572,7 +656,10 @@ def main(args):
         reward_scale=args.reward_scale,
         save_dir=args.save_dir,
         device=device,
-        use_reward_update=True
+        use_reward_update=True,
+        zero_shot_eval=args.zero_shot,
+        eval_interval=args.eval_interval,
+        eval_datasets=eval_datasets
     )
     
     # 保存奖励历史
@@ -581,17 +668,14 @@ def main(args):
     logger.info(f"奖励历史已保存至: {reward_path}")
     
     # 输出奖励曲线
-    try:
-        import matplotlib.pyplot as plt
-        plt.figure(figsize=(10, 5))
-        plt.plot(rewards)
-        plt.title('Rewards during training')
-        plt.xlabel('Episode')
-        plt.ylabel('Reward')
-        plt.savefig(os.path.join(args.save_dir, 'reward_curve.png'))
-        logger.info("奖励曲线已保存")
-    except ImportError:
-        logger.warning("无法导入matplotlib，跳过绘制奖励曲线")
+    import matplotlib.pyplot as plt
+    plt.figure(figsize=(10, 5))
+    plt.plot(rewards)
+    plt.title('Rewards during training')
+    plt.xlabel('Episode')
+    plt.ylabel('Reward')
+    plt.savefig(os.path.join(args.save_dir, 'reward_curve.png'))
+    logger.info("奖励曲线已保存")
     
     logger.info("训练流程已完成！")
 
