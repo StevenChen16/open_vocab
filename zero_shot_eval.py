@@ -12,6 +12,15 @@ from sklearn.manifold import TSNE
 from torch.utils.data import DataLoader, Dataset
 from ultralytics.engine.model import Model
 
+# 确保我们可以导入自定义模型组件
+import sys
+sys.path.append('.')
+try:
+    from model import OpenVocabDetect
+    from trainer import register_custom_modules, setup_logger, modify_yaml_config
+except ImportError:
+    print("警告: 无法导入自定义模型组件，请确保model.py和trainer.py在当前路径中")
+
 # 基类和新类的定义
 BASE_CLASSES = {
     # 人和交通工具
@@ -97,33 +106,107 @@ class FilteredDataset:
         """获取符合条件的样本索引"""
         valid_indices = []
         
-        for i in tqdm(range(len(self.dataset))):
-            sample = self.dataset[i]
-            
-            # 提取类别信息
-            if isinstance(sample, dict) and 'gt' in sample and 'classes' in sample['gt']:
-                classes = sample['gt']['classes']
-            elif isinstance(sample, tuple) and len(sample) > 2:
-                classes = sample[2]
-            else:
-                continue
-            
-            # 检查是否包含我们想要的类别
-            keep = False
-            
-            if self.split == 'train':
-                # 训练集：只保留包含base类别的样本，过滤掉包含新类别的样本
-                has_base = any(c.item() in BASE_CLASSES for c in classes)
-                has_novel = any(c.item() in NOVEL_CLASSES for c in classes)
+        # 添加进度条
+        self.logger.info(f"筛选{self.split}数据集样本...")
+        
+        # 统计变量
+        total_samples = len(self.dataset)
+        samples_with_base = 0
+        samples_with_novel = 0
+        samples_with_both = 0
+        samples_with_unknown = 0
+        
+        for i in tqdm(range(total_samples), desc=f"筛选{self.split}数据集"):
+            try:
+                sample = self.dataset[i]
                 
-                keep = has_base and not has_novel
-            elif self.split == 'test':
-                # 测试集：保留所有包含base类别或新类别的样本
-                has_target = any(c.item() in self.class_filter for c in classes)
-                keep = has_target
-            
-            if keep:
-                valid_indices.append(i)
+                # 提取类别信息 - 支持多种COCO数据格式
+                classes = None
+                
+                # 格式 1: {'img': img, 'gt': {'boxes': boxes, 'classes': classes}}
+                if isinstance(sample, dict) and 'gt' in sample and 'classes' in sample['gt']:
+                    classes = sample['gt']['classes']
+                
+                # 格式 2: {'img': img, 'label': [cls, boxes]} 或类似格式
+                elif isinstance(sample, dict) and 'label' in sample:
+                    if isinstance(sample['label'], (list, tuple)) and len(sample['label']) > 0:
+                        classes = sample['label'][0]  # 假设第一个元素是类别
+                
+                # 格式 3: (img, boxes, classes)
+                elif isinstance(sample, (list, tuple)) and len(sample) > 2:
+                    classes = sample[2]
+                
+                # 格式 4: {'img': img, 'cls': classes}
+                elif isinstance(sample, dict) and 'cls' in sample:
+                    classes = sample['cls']
+                
+                # 如果类别信息还是没提取出来，尝试遍历样本的所有字段
+                if classes is None and isinstance(sample, dict):
+                    for key, value in sample.items():
+                        if key.lower().find('class') >= 0 or key.lower().find('cls') >= 0:
+                            classes = value
+                            break
+                
+                # 如果还是找不到类别信息，跳过该样本
+                if classes is None:
+                    samples_with_unknown += 1
+                    continue
+                
+                # 确保classes是张量或列表等可迭代对象
+                if not hasattr(classes, '__iter__'):
+                    classes = [classes]
+                
+                # 检查类别ID - 安全地处理不同类型
+                class_ids = []
+                for c in classes:
+                    # 尝试提取类别ID，处理不同格式
+                    if hasattr(c, 'item'):  # 张量
+                        class_ids.append(c.item())
+                    elif isinstance(c, (int, float)):  # 原始数字
+                        class_ids.append(int(c))
+                    elif isinstance(c, str) and c.isdigit():  # 字符串数字
+                        class_ids.append(int(c))
+                
+                # 检查样本包含的类别
+                has_base = any(c_id in BASE_CLASSES for c_id in class_ids)
+                has_novel = any(c_id in NOVEL_CLASSES for c_id in class_ids)
+                
+                # 更新统计信息
+                if has_base:
+                    samples_with_base += 1
+                if has_novel:
+                    samples_with_novel += 1
+                if has_base and has_novel:
+                    samples_with_both += 1
+                
+                # 确定是否保留样本
+                keep = False
+                
+                if self.split == 'train':
+                    # 训练集：改为更松散的条件 - 包含任何基类就保留
+                    # 对于COCO这样的数据集，图片通常只有一个类别，所以这通常意味着不包含新类
+                    keep = has_base
+                    
+                    # 如果严格要求：只保留纯基类样本（不包含任何新类）
+                    # keep = has_base and not has_novel
+                elif self.split == 'test':
+                    # 测试集：保留包含指定类别过滤器中任何类别的样本
+                    keep = any(c_id in self.class_filter for c_id in class_ids)
+                
+                if keep:
+                    valid_indices.append(i)
+                    
+            except Exception as e:
+                self.logger.warning(f"处理样本 {i} 时出错: {str(e)}")
+        
+        # 输出统计信息
+        self.logger.info(f"{self.split}数据集统计:")
+        self.logger.info(f"总样本数: {total_samples}")
+        self.logger.info(f"包含基类的样本: {samples_with_base} ({samples_with_base/total_samples*100:.2f}%)")
+        self.logger.info(f"包含新类的样本: {samples_with_novel} ({samples_with_novel/total_samples*100:.2f}%)")
+        self.logger.info(f"同时包含基类和新类的样本: {samples_with_both} ({samples_with_both/total_samples*100:.2f}%)")
+        self.logger.info(f"无法识别类别的样本: {samples_with_unknown} ({samples_with_unknown/total_samples*100:.2f}%)")
+        self.logger.info(f"最终保留的有效样本: {len(valid_indices)} ({len(valid_indices)/total_samples*100:.2f}%)")
         
         return valid_indices
     
@@ -197,81 +280,82 @@ class ZeroShotEvaluator:
         # 遍历测试集
         for batch_idx, batch in enumerate(tqdm(test_dataset, desc="Evaluating")):
             # 准备数据
-            images = batch['img'].to(self.device)
-            gt_boxes = batch['gt']['boxes']
-            gt_classes = batch['gt']['classes']
-            
-            # 确保输入是批次
-            if images.dim() == 3:
-                images = images.unsqueeze(0)
-            
-            # 使用模型预测
-            with torch.no_grad():
-                outputs = self.model(images)
-                if isinstance(outputs, list) and len(outputs) == 2:  # 确保输出格式正确
-                    box_preds, semantic_features = outputs
-                else:
-                    self.logger.error(f"模型输出格式不正确，期望[boxes, semantics]但得到{type(outputs)}")
-                    continue
-            
-            # 处理每个样本
-            for i in range(len(images)):
-                sample_boxes = box_preds[i] if box_preds.dim() > 2 else box_preds
-                sample_semantic = semantic_features[i] if semantic_features.dim() > 2 else semantic_features
-                
-                # 确保GT数据在正确设备上
-                if isinstance(gt_boxes, list) and i < len(gt_boxes):
-                    sample_gt_boxes = gt_boxes[i].to(self.device)
-                    sample_gt_classes = gt_classes[i].to(self.device)
-                else:
-                    sample_gt_boxes = gt_boxes.to(self.device) if isinstance(gt_boxes, torch.Tensor) else torch.tensor([], device=self.device)
-                    sample_gt_classes = gt_classes.to(self.device) if isinstance(gt_classes, torch.Tensor) else torch.tensor([], device=self.device)
-                
-                # 使用语义特征计算与所有类别的相似度
-                similarities = torch.matmul(sample_semantic, self.all_embeddings.T)
-                
-                # 获取每个框的最大相似度和对应的类别
-                max_sim, pred_classes = similarities.max(dim=-1)
-                
-                # 应用置信度阈值
-                valid_mask = max_sim > conf_threshold
-                valid_boxes = sample_boxes[valid_mask]
-                valid_classes = pred_classes[valid_mask]
-                valid_scores = max_sim[valid_mask]
-                
-                # 如果没有有效预测，跳过当前样本
-                if len(valid_boxes) == 0:
-                    continue
-                
-                # 将预测类别转换为实际类别ID
-                pred_class_ids = []
-                for cls_idx in valid_classes:
-                    class_name = self.all_class_names[cls_idx]
-                    # 找到对应的类别ID
-                    class_id = None
-                    for id_, name in BASE_CLASSES.items():
-                        if name == class_name:
-                            class_id = id_
-                            break
-                    if class_id is None:
-                        for id_, name in NOVEL_CLASSES.items():
+            # 处理批次中的样本
+            for sample in batch:
+                # 提取图像和标签
+                if isinstance(sample, dict) and 'img' in sample:
+                    image = sample['img'].to(self.device)
+                    
+                    # 确保图像是4D：[batch, channels, height, width]
+                    if image.dim() == 3:
+                        image = image.unsqueeze(0)
+                    
+                    # 获取GT标注
+                    if 'gt' in sample and 'boxes' in sample['gt'] and 'classes' in sample['gt']:
+                        gt_boxes = sample['gt']['boxes'].to(self.device)
+                        gt_classes = sample['gt']['classes'].to(self.device)
+                    else:
+                        # 如果没有GT信息，跳过该样本
+                        continue
+                    
+                    # 使用模型预测
+                    with torch.no_grad():
+                        outputs = self.model(image)
+                        if isinstance(outputs, list) and len(outputs) == 2:  # 确保输出格式正确
+                            box_preds, semantic_features = outputs
+                        else:
+                            self.logger.warning(f"模型输出格式不正确，期望[boxes, semantics]但得到{type(outputs)}")
+                            continue
+                    
+                    # 确保维度正确
+                    sample_boxes = box_preds[0] if box_preds.dim() > 2 else box_preds
+                    sample_semantic = semantic_features[0] if semantic_features.dim() > 2 else semantic_features
+                    
+                    # 使用语义特征计算与所有类别的相似度
+                    similarities = torch.matmul(sample_semantic, self.all_embeddings.T)
+                    
+                    # 获取每个框的最大相似度和对应的类别
+                    max_sim, pred_classes = similarities.max(dim=-1)
+                    
+                    # 应用置信度阈值
+                    valid_mask = max_sim > conf_threshold
+                    valid_boxes = sample_boxes[valid_mask]
+                    valid_classes = pred_classes[valid_mask]
+                    valid_scores = max_sim[valid_mask]
+                    
+                    # 如果没有有效预测，跳过当前样本
+                    if len(valid_boxes) == 0:
+                        continue
+                    
+                    # 将预测类别转换为实际类别ID
+                    pred_class_ids = []
+                    for cls_idx in valid_classes:
+                        class_name = self.all_class_names[cls_idx]
+                        # 找到对应的类别ID
+                        class_id = None
+                        for id_, name in BASE_CLASSES.items():
                             if name == class_name:
                                 class_id = id_
                                 break
-                    if class_id is not None:
-                        pred_class_ids.append(class_id)
-                
-                if not pred_class_ids:
-                    continue
+                        if class_id is None:
+                            for id_, name in NOVEL_CLASSES.items():
+                                if name == class_name:
+                                    class_id = id_
+                                    break
+                        if class_id is not None:
+                            pred_class_ids.append(class_id)
                     
-                pred_class_ids = torch.tensor(pred_class_ids, device=self.device)
-                
-                # 评估检测结果
-                self._evaluate_predictions(
-                    valid_boxes, pred_class_ids, valid_scores,
-                    sample_gt_boxes, sample_gt_classes,
-                    results, iou_threshold
-                )
+                    if not pred_class_ids:
+                        continue
+                        
+                    pred_class_ids = torch.tensor(pred_class_ids, device=self.device)
+                    
+                    # 评估检测结果
+                    self._evaluate_predictions(
+                        valid_boxes, pred_class_ids, valid_scores,
+                        gt_boxes, gt_classes,
+                        results, iou_threshold
+                    )
         
         # 计算性能指标
         for split in ['base', 'novel', 'all']:
@@ -609,7 +693,6 @@ def prepare_datasets(coco_dataset, batch_size=16, num_workers=4):
     logger = setup_logger()
     logger.info("准备数据集...")
     
-    logger.info("创建基类数据集...")
     # 创建训练集（只包含基类）
     train_dataset = FilteredDataset(coco_dataset, BASE_CLASSES, split='train')
     
@@ -619,7 +702,6 @@ def prepare_datasets(coco_dataset, batch_size=16, num_workers=4):
     # 创建新类测试集
     novel_test_dataset = FilteredDataset(coco_dataset, NOVEL_CLASSES, split='test')
     
-    logger.info("创建数据加载器...")
     # 创建数据加载器
     train_dataloader = DataLoader(
         train_dataset,
@@ -650,13 +732,138 @@ def prepare_datasets(coco_dataset, batch_size=16, num_workers=4):
     return train_dataloader, base_test_dataloader, novel_test_dataloader
 
 
-def run_evaluation(model_path, test_dataloader, output_dir='evaluation_results'):
+def load_model(model_path, base_model_path='yolo11n.pt', device='cuda'):
+    """
+    加载模型，支持多种格式
+    
+    Args:
+        model_path: 模型路径
+        base_model_path: 基础YOLO模型路径，用于重建模型结构
+        device: 设备
+        
+    Returns:
+        加载的模型
+    """
+    logger = setup_logger()
+    logger.info(f"正在加载模型: {model_path}")
+    
+    try:
+        # 首先尝试正常加载
+        model = Model(model_path)
+        logger.info("成功通过Ultralytics Model类加载模型")
+        return model
+    except Exception as e:
+        logger.warning(f"通过Ultralytics Model类加载失败: {str(e)}")
+        logger.info("尝试加载state_dict...")
+
+        try:
+            # 尝试加载为state_dict
+            state_dict = torch.load(model_path, map_location=device)
+            
+            # 注册自定义模块
+            try:
+                register_custom_modules()
+                logger.info("已注册自定义模块")
+            except NameError:
+                logger.warning("无法注册自定义模块，这可能会导致问题")
+            
+            # 加载基础模型
+            base_model = Model(base_model_path)
+            logger.info(f"已加载基础模型: {base_model_path}")
+            
+            # 检查模型结构，确保OpenVocabDetect作为检测头
+            detection_head = base_model.model.model[-1]
+            head_type = type(detection_head).__name__
+            
+            if head_type != 'OpenVocabDetect':
+                logger.warning(f"检测头类型不是OpenVocabDetect，而是{head_type}，尝试替换...")
+                
+                # 创建自定义检测头并替换原始检测头
+                from model import OpenVocabDetect
+                
+                # 获取通道信息
+                ch_list = []
+                for m in detection_head.modules():
+                    if isinstance(m, nn.Conv2d) and m.in_channels in [64, 128, 256, 512, 1024]:
+                        ch_list.append(m.in_channels)
+                        
+                if not ch_list:
+                    ch_list = [64, 128, 256]  # 默认通道数
+                
+                # 提取原始检测头的属性
+                if hasattr(detection_head, 'anchors'):
+                    original_anchors = detection_head.anchors.clone().cpu().numpy()
+                else:
+                    original_anchors = np.array([[10, 13, 16, 30, 33, 23], [30, 61, 62, 45, 59, 119], [116, 90, 156, 198, 373, 326]])
+                
+                # 创建新的检测头
+                new_detection_head = OpenVocabDetect(
+                    nc=80,
+                    anchors=original_anchors,
+                    ch=ch_list,
+                    semantic_dim=512
+                )
+                
+                # 复制关键属性
+                if hasattr(detection_head, 'stride'):
+                    new_detection_head.stride = detection_head.stride
+                if hasattr(detection_head, 'inplace'):
+                    new_detection_head.inplace = detection_head.inplace
+                
+                # 更换检测头
+                base_model.model.model[-1] = new_detection_head
+                logger.info("成功替换检测头为OpenVocabDetect")
+            
+            # 加载state_dict
+            if isinstance(state_dict, dict) and 'model' in state_dict:
+                # 如果是完整模型字典
+                base_model.model.load_state_dict(state_dict['model'])
+                logger.info("已加载模型权重 (从'model'键)")
+            elif isinstance(state_dict, dict) and any(k.startswith('model.') for k in state_dict.keys()):
+                # 如果键以'model.'开头
+                # 移除'model.'前缀
+                new_state_dict = {k.replace('model.', ''): v for k, v in state_dict.items() if k.startswith('model.')}
+                base_model.model.load_state_dict(new_state_dict, strict=False)
+                logger.info("已加载模型权重 (移除'model.'前缀)")
+            else:
+                # 直接尝试加载
+                try:
+                    base_model.model.load_state_dict(state_dict, strict=False)
+                    logger.info("已直接加载state_dict权重")
+                except Exception as e:
+                    logger.warning(f"加载state_dict失败: {str(e)}")
+                    logger.info("尝试最后的加载方法...")
+                    
+                    # 创建新的state_dict
+                    new_state_dict = {}
+                    for k, v in state_dict.items():
+                        if k.startswith('model.'):
+                            new_state_dict[k[6:]] = v  # 删除'model.'前缀
+                        else:
+                            new_state_dict[k] = v
+                    
+                    # 尝试加载
+                    base_model.model.load_state_dict(new_state_dict, strict=False)
+                    logger.info("成功加载模型权重")
+            
+            # 确保模型在正确的设备上
+            base_model.model = base_model.model.to(device)
+            
+            return base_model
+            
+        except Exception as e:
+            logger.error(f"无法加载模型: {str(e)}")
+            raise e
+
+
+def run_evaluation(model_path, test_dataloader, base_model_path='yolo11n.pt', output_dir='evaluation_results'):
     """
     运行完整的零样本评估
     
     Args:
         model_path: 模型路径
         test_dataloader: 测试数据加载器
+        base_model_path: 基础YOLO模型路径
         output_dir: 输出目录
     """
     logger = setup_logger()
@@ -665,8 +872,8 @@ def run_evaluation(model_path, test_dataloader, output_dir='evaluation_results')
     # 创建输出目录
     os.makedirs(output_dir, exist_ok=True)
     
-    # 加载模型
-    model = Model(model_path)
+    # 加载模型 - 使用改进的加载函数
+    model = load_model(model_path, base_model_path)
     model.eval()
     
     # 创建评估器
@@ -747,6 +954,7 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser(description="零样本目标检测评估")
     parser.add_argument('--model', type=str, required=True, help='模型路径')
+    parser.add_argument('--base-model', type=str, default='yolo11n.pt', help='基础YOLO模型路径')
     parser.add_argument('--data', type=str, required=True, help='COCO数据集路径')
     parser.add_argument('--batch-size', type=int, default=8, help='批大小')
     parser.add_argument('--output-dir', type=str, default='evaluation_results', help='输出目录')
@@ -772,4 +980,4 @@ if __name__ == "__main__":
     _, base_test_loader, novel_test_loader = prepare_datasets(test_dataset, batch_size=args.batch_size)
     
     # 运行评估
-    run_evaluation(args.model, novel_test_loader, output_dir=args.output_dir)
+    run_evaluation(args.model, novel_test_loader, base_model_path=args.base_model, output_dir=args.output_dir)
