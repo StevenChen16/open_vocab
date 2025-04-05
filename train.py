@@ -120,7 +120,7 @@ def load_coco_dataset(data_yaml, img_size=640):
     
     # 如果提供了YAML文件，则加载它
     if os.path.exists(data_yaml):
-        with open(data_yaml, 'r') as f:
+        with open(data_yaml, 'r', encoding='utf-8') as f:
             yaml_dict = yaml.safe_load(f)
             # 合并YAML配置
             for k, v in yaml_dict.items():

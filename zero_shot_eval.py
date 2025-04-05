@@ -97,7 +97,7 @@ class FilteredDataset:
         """获取符合条件的样本索引"""
         valid_indices = []
         
-        for i in range(len(self.dataset)):
+        for i in tqdm(range(len(self.dataset))):
             sample = self.dataset[i]
             
             # 提取类别信息
@@ -609,6 +609,7 @@ def prepare_datasets(coco_dataset, batch_size=16, num_workers=4):
     logger = setup_logger()
     logger.info("准备数据集...")
     
+    logger.info("创建基类数据集...")
     # 创建训练集（只包含基类）
     train_dataset = FilteredDataset(coco_dataset, BASE_CLASSES, split='train')
     
@@ -618,6 +619,7 @@ def prepare_datasets(coco_dataset, batch_size=16, num_workers=4):
     # 创建新类测试集
     novel_test_dataset = FilteredDataset(coco_dataset, NOVEL_CLASSES, split='test')
     
+    logger.info("创建数据加载器...")
     # 创建数据加载器
     train_dataloader = DataLoader(
         train_dataset,
